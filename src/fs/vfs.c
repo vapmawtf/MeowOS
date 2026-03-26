@@ -1,0 +1,522 @@
+#include <meow/vfs.h>
+#include <meow/string.h>
+
+#define VFS_MAX_BLOCK_DEVICES 8
+
+typedef struct VFS_BlockDevice {
+    char name[16];
+    uint32_t sector_size;
+    uint32_t sector_count;
+    vfs_block_read_fn read;
+    void* read_user;
+    uint8_t present;
+} VFS_BlockDevice;
+
+static VFS_BlockDevice g_devices[VFS_MAX_BLOCK_DEVICES];
+static FAT32_FS g_root_fat;
+static uint8_t g_root_mounted;
+
+typedef struct VFS_OpenFile {
+    uint8_t used;
+    FAT32_File file;
+} VFS_OpenFile;
+
+#define VFS_MAX_OPEN_FILES 16
+static VFS_OpenFile g_open_files[VFS_MAX_OPEN_FILES];
+
+static int vfs_read_bridge(void* user, uint32_t lba, uint32_t count, void* buffer);
+
+static uint32_t rd32le(const uint8_t* p)
+{
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static uint64_t rd64le(const uint8_t* p)
+{
+    return (uint64_t)rd32le(p) | ((uint64_t)rd32le(p + 4) << 32);
+}
+
+static int try_mount_lba(VFS_BlockDevice* dev, uint32_t lba)
+{
+    if (fat32_mount(&g_root_fat, vfs_read_bridge, dev, lba) == 0)
+    {
+        g_root_mounted = 1;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int probe_mbr_partitions(VFS_BlockDevice* dev)
+{
+    if (vfs_read_bridge(dev, 0, 1, g_root_fat.sector_scratch) != 0)
+    {
+        return -1;
+    }
+
+    if (g_root_fat.sector_scratch[510] != 0x55 || g_root_fat.sector_scratch[511] != 0xAA)
+    {
+        return -1;
+    }
+
+    for (size_t i = 0; i < 4; i++)
+    {
+        const uint8_t* entry = &g_root_fat.sector_scratch[446 + (i * 16)];
+        uint8_t type = entry[4];
+        uint32_t start_lba = rd32le(&entry[8]);
+
+        if (type == 0 || start_lba == 0)
+        {
+            continue;
+        }
+
+        if (try_mount_lba(dev, start_lba) == 0)
+        {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int probe_gpt_partitions(VFS_BlockDevice* dev)
+{
+    uint8_t header[512];
+    uint8_t entry_sector[512];
+
+    if (vfs_read_bridge(dev, 1, 1, header) != 0)
+    {
+        return -1;
+    }
+
+    if (memcmp(header, "EFI PART", 8) != 0)
+    {
+        return -1;
+    }
+
+    uint64_t entries_lba64 = rd64le(&header[72]);
+    uint32_t entry_count = rd32le(&header[80]);
+    uint32_t entry_size = rd32le(&header[84]);
+
+    if (entries_lba64 == 0 || entry_count == 0 || entry_size < 56 || entry_size > 512)
+    {
+        return -1;
+    }
+
+    uint32_t entries_lba = (uint32_t)entries_lba64;
+    if ((uint64_t)entries_lba != entries_lba64)
+    {
+        return -1;
+    }
+
+    uint32_t max_entries = entry_count;
+    if (max_entries > 128u)
+    {
+        max_entries = 128u;
+    }
+
+    for (uint32_t i = 0; i < max_entries; i++)
+    {
+        uint32_t byte_off = i * entry_size;
+        uint32_t sector_off = byte_off / 512u;
+        uint32_t in_sector = byte_off % 512u;
+        const uint8_t* e;
+        uint8_t type_empty = 1;
+
+        if (in_sector + entry_size > 512u)
+        {
+            break;
+        }
+
+        if (vfs_read_bridge(dev, entries_lba + sector_off, 1, entry_sector) != 0)
+        {
+            return -1;
+        }
+
+        e = &entry_sector[in_sector];
+
+        for (size_t b = 0; b < 16; b++)
+        {
+            if (e[b] != 0)
+            {
+                type_empty = 0;
+                break;
+            }
+        }
+
+        if (type_empty)
+        {
+            continue;
+        }
+
+        uint64_t first_lba64 = rd64le(&e[32]);
+        if (first_lba64 == 0)
+        {
+            continue;
+        }
+
+        uint32_t first_lba = (uint32_t)first_lba64;
+        if ((uint64_t)first_lba != first_lba64)
+        {
+            continue;
+        }
+
+        if (try_mount_lba(dev, first_lba) == 0)
+        {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int probe_common_lbas(VFS_BlockDevice* dev)
+{
+    static const uint32_t common_lbas[] = {
+        2048u, 4096u, 8192u, 16384u, 32768u, 63u
+    };
+
+    for (size_t i = 0; i < sizeof(common_lbas) / sizeof(common_lbas[0]); i++)
+    {
+        if (try_mount_lba(dev, common_lbas[i]) == 0)
+        {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int probe_linear_lba_scan(VFS_BlockDevice* dev)
+{
+    uint32_t limit = dev->sector_count;
+
+    if (limit == 0 || limit > 262144u)
+    {
+        limit = 262144u;
+    }
+
+    for (uint32_t lba = 1; lba < limit; lba++)
+    {
+        if (try_mount_lba(dev, lba) == 0)
+        {
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static void copy_name(char dst[16], const char* src)
+{
+    size_t i = 0;
+    if (!src)
+    {
+        dst[0] = '\0';
+        return;
+    }
+
+    while (src[i] && i < 15)
+    {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static VFS_BlockDevice* find_device(const char* name)
+{
+    for (size_t i = 0; i < VFS_MAX_BLOCK_DEVICES; i++)
+    {
+        if (!g_devices[i].present)
+        {
+            continue;
+        }
+        if (strcmp(g_devices[i].name, name) == 0)
+        {
+            return &g_devices[i];
+        }
+    }
+    return 0;
+}
+
+static int vfs_read_bridge(void* user, uint32_t lba, uint32_t count, void* buffer)
+{
+    VFS_BlockDevice* dev = (VFS_BlockDevice*)user;
+    if (!dev || !dev->read)
+    {
+        return -1;
+    }
+    return dev->read(dev->read_user, lba, count, buffer);
+}
+
+void vfs_init(void)
+{
+    memset(g_devices, 0, sizeof(g_devices));
+    memset(&g_root_fat, 0, sizeof(g_root_fat));
+    memset(g_open_files, 0, sizeof(g_open_files));
+    g_root_mounted = 0;
+}
+
+int vfs_register_block_device(
+    const char* name,
+    uint32_t sector_size,
+    uint32_t sector_count,
+    vfs_block_read_fn read,
+    void* read_user)
+{
+    if (!name || !name[0] || sector_size == 0)
+    {
+        return -1;
+    }
+
+    if (find_device(name))
+    {
+        return -1;
+    }
+
+    for (size_t i = 0; i < VFS_MAX_BLOCK_DEVICES; i++)
+    {
+        if (!g_devices[i].present)
+        {
+            copy_name(g_devices[i].name, name);
+            g_devices[i].sector_size = sector_size;
+            g_devices[i].sector_count = sector_count;
+            g_devices[i].read = read;
+            g_devices[i].read_user = read_user;
+            g_devices[i].present = 1;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+size_t vfs_block_device_count(void)
+{
+    size_t count = 0;
+    for (size_t i = 0; i < VFS_MAX_BLOCK_DEVICES; i++)
+    {
+        if (g_devices[i].present)
+        {
+            count++;
+        }
+    }
+    return count;
+}
+
+int vfs_get_block_device(size_t index, VFS_BlockDeviceInfo* out_info)
+{
+    size_t seen = 0;
+
+    if (!out_info)
+    {
+        return -1;
+    }
+
+    for (size_t i = 0; i < VFS_MAX_BLOCK_DEVICES; i++)
+    {
+        if (!g_devices[i].present)
+        {
+            continue;
+        }
+
+        if (seen == index)
+        {
+            copy_name(out_info->name, g_devices[i].name);
+            out_info->sector_size = g_devices[i].sector_size;
+            out_info->sector_count = g_devices[i].sector_count;
+            out_info->readable = g_devices[i].read ? 1u : 0u;
+            return 0;
+        }
+
+        seen++;
+    }
+
+    return -1;
+}
+
+int vfs_mount_fat32_root(const char* device_name, uint32_t partition_lba)
+{
+    VFS_BlockDevice* dev;
+
+    if (!device_name)
+    {
+        return -1;
+    }
+
+    dev = find_device(device_name);
+    if (!dev || !dev->read)
+    {
+        return -1;
+    }
+
+    if (try_mount_lba(dev, partition_lba) != 0)
+    {
+        if (partition_lba != 0)
+        {
+            return -1;
+        }
+
+        if (probe_mbr_partitions(dev) == 0)
+        {
+            return 0;
+        }
+
+        if (probe_gpt_partitions(dev) == 0)
+        {
+            return 0;
+        }
+
+        if (probe_common_lbas(dev) == 0)
+        {
+            return 0;
+        }
+
+        if (probe_linear_lba_scan(dev) == 0)
+        {
+            return 0;
+        }
+
+        return -1;
+    }
+
+    return 0;
+}
+
+int vfs_is_root_mounted(void)
+{
+    return g_root_mounted ? 1 : 0;
+}
+
+int vfs_list_dir(const char* path, fat32_list_callback_fn callback, void* callback_user)
+{
+    if (!g_root_mounted)
+    {
+        return -1;
+    }
+
+    return fat32_list_dir(&g_root_fat, path ? path : "/", callback, callback_user);
+}
+
+int vfs_read_file(const char* path, uint32_t offset, void* out_buffer, uint32_t bytes_to_read, uint32_t* out_bytes_read)
+{
+    FAT32_File file;
+
+    if (!g_root_mounted || !path || !out_buffer)
+    {
+        return -1;
+    }
+
+    if (fat32_open(&g_root_fat, path, &file) != 0)
+    {
+        return -1;
+    }
+
+    if (fat32_seek(&file, offset) != 0)
+    {
+        return -1;
+    }
+
+    return fat32_read(&file, out_buffer, bytes_to_read, out_bytes_read);
+}
+
+int vfs_read_block_device(const char* device_name, uint32_t lba, uint32_t count, void* out_buffer)
+{
+    VFS_BlockDevice* dev;
+
+    if (!device_name || !out_buffer || count == 0)
+    {
+        return -1;
+    }
+
+    dev = find_device(device_name);
+    if (!dev || !dev->read)
+    {
+        return -1;
+    }
+
+    if (dev->sector_count != 0 && (lba + count > dev->sector_count))
+    {
+        return -1;
+    }
+
+    return dev->read(dev->read_user, lba, count, out_buffer);
+}
+
+int vfs_file_open(const char* path)
+{
+    FAT32_File file;
+
+    if (!g_root_mounted || !path)
+    {
+        return -1;
+    }
+
+    if (fat32_open(&g_root_fat, path, &file) != 0)
+    {
+        return -1;
+    }
+
+    for (int i = 0; i < VFS_MAX_OPEN_FILES; i++)
+    {
+        if (!g_open_files[i].used)
+        {
+            g_open_files[i].used = 1;
+            g_open_files[i].file = file;
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+int vfs_file_read(int handle, void* out_buffer, uint32_t bytes_to_read, uint32_t* out_bytes_read)
+{
+    if (handle < 0 || handle >= VFS_MAX_OPEN_FILES || !out_buffer)
+    {
+        return -1;
+    }
+
+    if (!g_open_files[handle].used)
+    {
+        return -1;
+    }
+
+    return fat32_read(&g_open_files[handle].file, out_buffer, bytes_to_read, out_bytes_read);
+}
+
+int vfs_file_seek(int handle, uint32_t offset)
+{
+    if (handle < 0 || handle >= VFS_MAX_OPEN_FILES)
+    {
+        return -1;
+    }
+
+    if (!g_open_files[handle].used)
+    {
+        return -1;
+    }
+
+    return fat32_seek(&g_open_files[handle].file, offset);
+}
+
+int vfs_file_close(int handle)
+{
+    if (handle < 0 || handle >= VFS_MAX_OPEN_FILES)
+    {
+        return -1;
+    }
+
+    if (!g_open_files[handle].used)
+    {
+        return -1;
+    }
+
+    g_open_files[handle].used = 0;
+    memset(&g_open_files[handle].file, 0, sizeof(g_open_files[handle].file));
+    return 0;
+}
