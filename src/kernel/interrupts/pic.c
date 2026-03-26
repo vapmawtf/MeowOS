@@ -1,8 +1,7 @@
 #include <stdint.h>
 #include <meow/pic.h>
 
-void pic_remap()
-{
+void pic_remap() {
     uint8_t a1 = inb(PIC1_DATA);
     uint8_t a2 = inb(PIC2_DATA);
 

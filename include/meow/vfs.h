@@ -40,6 +40,7 @@ int vfs_write_block_device(const char* device_name, uint32_t lba, uint32_t count
 int vfs_create_file(const char* path);
 int vfs_write_file(const char* path, const void* data, uint32_t size);
 int vfs_mkdir(const char* path);
+int vfs_link(const char* existing_path, const char* new_path);
 
 int vfs_file_open(const char* path);
 int vfs_file_read(int handle, void* out_buffer, uint32_t bytes_to_read, uint32_t* out_bytes_read);

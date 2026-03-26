@@ -2,167 +2,128 @@
 #include <meow/vga.h>
 #include <stdarg.h>
 
-uint8_t inb(uint16_t port)
-{
+uint8_t inb(uint16_t port) {
     uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    __asm__ volatile("inb %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
-uint16_t inw(uint16_t port)
-{
+uint16_t inw(uint16_t port) {
     uint16_t ret;
-    __asm__ volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    __asm__ volatile("inw %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
-uint32_t inl(uint16_t port)
-{
+uint32_t inl(uint16_t port) {
     uint32_t ret;
-    __asm__ volatile ("inl %1, %0" : "=a"(ret) : "Nd"(port));
+    __asm__ volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
 
-void outb(uint16_t port, uint8_t val)
-{
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
+void outb(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
 
-void outw(uint16_t port, uint16_t val)
-{
-    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
+void outw(uint16_t port, uint16_t val) {
+    __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 
-void outl(uint16_t port, uint32_t val)
-{
-    __asm__ volatile ("outl %0, %1" : : "a"(val), "Nd"(port));
+void outl(uint16_t port, uint32_t val) {
+    __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
 }
 
-void io_wait(void)
-{
+void io_wait(void) {
     outb(0x80, 0);
 }
 
-void putchar(int c)
-{
-    char out[2] = {(char)c, '\0'};
+void putchar(int c) {
+    char out[2] = { (char)c, '\0' };
     printstr(out);
 }
 
-int puts(const char* str)
-{
+int puts(const char* str) {
     printstr(str);
     printstr("\n");
     return 0;
 }
 
-static void print_unsigned(unsigned int value, int base)
-{
+static void print_unsigned(unsigned int value, int base) {
     char buffer[32];
     int index = 0;
 
-    if (value == 0)
-    {
+    if (value == 0) {
         putchar('0');
         return;
     }
 
     const char* digits = "0123456789ABCDEF";
-    while (value > 0)
-    {
+    while (value > 0) {
         buffer[index++] = digits[value % base];
         value /= base;
     }
 
-    while (index > 0)
-    {
+    while (index > 0) {
         putchar(buffer[--index]);
     }
 }
 
-static void print_int(int value)
-{
+static void print_int(int value) {
     char buffer[12];
     int index = 0;
     unsigned int uvalue;
 
-    if (value < 0)
-    {
+    if (value < 0) {
         putchar('-');
-        uvalue = (unsigned int)(- (long)value);
-    }
-    else
-    {
+        uvalue = (unsigned int)(-(long)value);
+    } else {
         uvalue = (unsigned int)value;
     }
 
-    if (uvalue == 0)
-    {
+    if (uvalue == 0) {
         putchar('0');
         return;
     }
 
-    while (uvalue > 0)
-    {
+    while (uvalue > 0) {
         buffer[index++] = '0' + (uvalue % 10);
         uvalue /= 10;
     }
 
-    while (index > 0)
-    {
+    while (index > 0) {
         putchar(buffer[--index]);
     }
 }
 
-void printf(const char* format, ...)
-{
+void printf(const char* format, ...) {
     va_list args;
     va_start(args, format);
 
-    while (*format)
-    {
-        if (*format == '%')
-        {
+    while (*format) {
+        if (*format == '%') {
             format++;
 
-            if (*format == '\0')
-            {
+            if (*format == '\0') {
                 break;
             }
 
-            if (*format == 's')
-            {
+            if (*format == 's') {
                 const char* str = va_arg(args, const char*);
                 printstr(str ? str : "(null)");
-            }
-            else if (*format == 'd')
-            {
+            } else if (*format == 'd') {
                 print_int(va_arg(args, int));
-            }
-            else if (*format == 'c')
-            {
+            } else if (*format == 'c') {
                 putchar(va_arg(args, int));
-            }
-            else if (*format == '%')
-            {
+            } else if (*format == '%') {
                 putchar('%');
-            }
-            else if (*format == 'u')
-            {
+            } else if (*format == 'u') {
                 print_unsigned(va_arg(args, unsigned int), 10);
-            }
-            else if (*format == 'x')
-            {
+            } else if (*format == 'x') {
                 print_unsigned(va_arg(args, unsigned int), 16);
-            }
-            else
-            {
+            } else {
                 putchar('%');
                 putchar(*format);
             }
-        }
-        else
-        {
+        } else {
             putchar(*format);
         }
 
@@ -172,40 +133,29 @@ void printf(const char* format, ...)
     va_end(args);
 }
 
-char getchar()
-{
-    while (1)
-    {
+char getchar() {
+    while (1) {
         int c = kb_pop();
-        if (c >= 0)
-        {
+        if (c >= 0) {
             return (char)c;
         }
     }
 }
 
-void read_line(char* buffer, size_t max_length)
-{
+void read_line(char* buffer, size_t max_length) {
     size_t index = 0;
-    while (index < max_length - 1)
-    {
+    while (index < max_length - 1) {
         char c = getchar();
 
-        if (c == '\r' || c == '\n')
-        {
+        if (c == '\r' || c == '\n') {
             putchar('\n');
             break;
-        }
-        else if (c == '\b' || c == 127)
-        {
-            if (index > 0)
-            {
+        } else if (c == '\b' || c == 127) {
+            if (index > 0) {
                 index--;
                 printf("\b \b");
             }
-        }
-        else if (c >= ' ' && c <= '~')
-        {
+        } else if (c >= ' ' && c <= '~') {
             buffer[index++] = c;
             putchar(c); // echo
         }
@@ -213,25 +163,21 @@ void read_line(char* buffer, size_t max_length)
     buffer[index] = '\0';
 }
 
-int atoi(const char* str)
-{
+int atoi(const char* str) {
     int result = 0;
     int sign = 1;
 
-    while (*str == ' ' || *str == '\t') str++;
+    while (*str == ' ' || *str == '\t')
+        str++;
 
-    if (*str == '-')
-    {
+    if (*str == '-') {
         sign = -1;
         str++;
-    }
-    else if (*str == '+')
-    {
+    } else if (*str == '+') {
         str++;
     }
 
-    while (*str >= '0' && *str <= '9')
-    {
+    while (*str >= '0' && *str <= '9') {
         result = result * 10 + (*str - '0');
         str++;
     }
@@ -240,13 +186,14 @@ int atoi(const char* str)
 }
 
 #define KEYBOARD_BUFFER_SIZE 128
+#define KBD_DATA_PORT 0x60
+#define KBD_STATUS_PORT 0x64
 
 static volatile char kb_buffer[KEYBOARD_BUFFER_SIZE];
 static volatile int kb_head = 0;
 static volatile int kb_tail = 0;
 
-void kb_push(char c)
-{
+void kb_push(char c) {
     int next = (kb_head + 1) % KEYBOARD_BUFFER_SIZE;
     if (next != kb_tail) // jeśli nie przepełniony
     {
@@ -255,9 +202,35 @@ void kb_push(char c)
     }
 }
 
-int kb_pop()
-{
-    if (kb_head == kb_tail) return -1; // pusty
+int kb_pop() {
+    if (kb_head == kb_tail) {
+        if ((inb(KBD_STATUS_PORT) & 0x01u) != 0) {
+            uint8_t sc = inb(KBD_DATA_PORT);
+            if ((sc & 0x80u) == 0) {
+                static const char map[128] = {
+                    [0x02] = '1', [0x03] = '2',  [0x04] = '3',  [0x05] = '4',  [0x06] = '5',
+                    [0x07] = '6', [0x08] = '7',  [0x09] = '8',  [0x0A] = '9',  [0x0B] = '0',
+                    [0x0C] = '-', [0x0D] = '=',  [0x0E] = '\b', [0x0F] = '\t', [0x10] = 'q',
+                    [0x11] = 'w', [0x12] = 'e',  [0x13] = 'r',  [0x14] = 't',  [0x15] = 'y',
+                    [0x16] = 'u', [0x17] = 'i',  [0x18] = 'o',  [0x19] = 'p',  [0x1A] = '[',
+                    [0x1B] = ']', [0x1C] = '\n', [0x1E] = 'a',  [0x1F] = 's',  [0x20] = 'd',
+                    [0x21] = 'f', [0x22] = 'g',  [0x23] = 'h',  [0x24] = 'j',  [0x25] = 'k',
+                    [0x26] = 'l', [0x27] = ';',  [0x28] = '\'', [0x29] = '`',  [0x2B] = '\\',
+                    [0x2C] = 'z', [0x2D] = 'x',  [0x2E] = 'c',  [0x2F] = 'v',  [0x30] = 'b',
+                    [0x31] = 'n', [0x32] = 'm',  [0x33] = ',',  [0x34] = '.',  [0x35] = '/',
+                    [0x39] = ' '
+                };
+
+                char c = map[sc & 0x7Fu];
+                if (c != 0) {
+                    return (int)c;
+                }
+            }
+        }
+
+        return -1;
+    }
+
     char c = kb_buffer[kb_tail];
     kb_tail = (kb_tail + 1) % KEYBOARD_BUFFER_SIZE;
     return c;
