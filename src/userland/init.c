@@ -334,7 +334,7 @@ static int load_elf64_from_memory(const uint8_t* image, uint32_t image_size, uin
 
 static int load_elf64_from_initramfs(const uint8_t* image, uint32_t image_size, uint64_t* out_entry,
                                      const char** out_path) {
-    static const char* const candidates[] = { "bin/meowbox", "bin/sh", "BIN/SH" };
+    static const char* const candidates[] = { "bin/toybox", "bin/sh", "BIN/SH" };
 
     for (size_t i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); i++) {
         const uint8_t* data = NULL;
@@ -617,8 +617,7 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
             printf("Loaded 64-bit %s from initramfs entry=0x%x\n",
                    payload_path ? payload_path : "payload", (uint32_t)elf64_entry);
 
-
-            #include <meow/enter_user_mode.h>
+#include <meow/enter_user_mode.h>
             uint64_t user_stack = 0x80000; // Use a low, identity-mapped stack address
             printf("Entering user mode at 0x%x with stack 0x%x...\n", (uint32_t)elf64_entry,
                    (uint32_t)user_stack);
@@ -628,7 +627,7 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
         }
     }
 
-    kernel_panic("No runnable initramfs payload (expected bin/meowbox)");
+    kernel_panic("No runnable initramfs payload (expected /bin/sh)");
 #endif
 
     kernel_panic("No valid userland entry point found");

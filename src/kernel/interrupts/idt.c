@@ -2,7 +2,6 @@
 
 extern void default_interrupt_stub();
 
-
 struct IDT_entry idt[256];
 static uint16_t idt_code_selector;
 
@@ -26,8 +25,12 @@ void set_idt_gate_user(int n, uint64_t handler) {
     idt[n].zero = 0;
 }
 
-
 static struct IDT_ptr idt_ptr;
+
+__attribute__((naked)) void default_interrupt_stub(void)
+{
+    __asm__ volatile("iretq");
+}
 
 void idt_install() {
     uint16_t cs;

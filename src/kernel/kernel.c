@@ -3,6 +3,7 @@
 #include <meow/vga.h>
 #include <meow/io.h>
 #include <meow/gdt.h>
+#include <meow/idt.h>
 #include <meow/isr.h>
 #include <meow/userland/init.h>
 #include <meow/panic.h>
@@ -49,8 +50,12 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr) {
         }
     }
 
+
     gdt_init();
     interrupts_init();
+
+    // Reload IDT after long mode switch to ensure valid 64-bit pointer
+    idt_install();
 
     init_userland(initramfs_addr, initramfs_size);
 

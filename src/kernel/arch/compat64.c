@@ -6,5 +6,4 @@ void gdt_init(void) {}
 
 void interrupts_init(void) {}
 
-
 // enter_user_mode is obsolete in pure 64-bit mode.

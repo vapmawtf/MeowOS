@@ -115,9 +115,9 @@ void interrupts_init() {
 
     idt_install();
     pic_remap();
-    set_idt_gate(0x20, (uint32_t)irq0_stub);
-    set_idt_gate(0x21, (uint32_t)irq1_stub);
-    set_idt_gate_user(0x80, (uint32_t)syscall_stub);
+    set_idt_gate(0x20, (uint64_t)irq0_stub);
+    set_idt_gate(0x21, (uint64_t)irq1_stub);
+    set_idt_gate_user(0x80, (uint64_t)syscall_stub);
     syscall_init();
 
     // Enable IRQ0/IRQ1 and keep IRQ2 (cascade to slave PIC) unmasked.
