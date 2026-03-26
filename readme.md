@@ -7,8 +7,8 @@
 - [x] working framebuffer
 - [x] working shell
 - [x] kind of working fat32 fs
-- [] hope
-- [] brain
+- [ ] hope
+- [ ] brain
 
 ### Here's a screenshot from one of the first versions!
 ![screenshot](assets/ss.png)
