@@ -7,6 +7,7 @@
 #include <meow/vfs.h>
 #include <meow/gdt.h>
 #include <meow/panic.h>
+#include <meow/enter_user_mode.h>
 
 typedef struct ELF32_Ehdr {
     uint8_t e_ident[16];
@@ -158,6 +159,10 @@ static int is_cpio_candidate(const char* name, const char* want) {
     return 0;
 }
 
+static int find_file_in_initramfs_internal(const uint8_t* image, uint32_t image_size,
+                                           const char* path, const uint8_t** out_data,
+                                           uint32_t* out_size, int depth);
+
 static int find_file_in_initramfs(const uint8_t* image, uint32_t image_size, const char* path,
                                   const uint8_t** out_data, uint32_t* out_size) {
     return find_file_in_initramfs_internal(image, image_size, path, out_data, out_size, 0);
@@ -238,119 +243,49 @@ static int find_file_in_initramfs_internal(const uint8_t* image, uint32_t image_
     return -1;
 }
 
-static int load_elf32_from_memory(const uint8_t* image, uint32_t image_size, uint32_t* out_entry) {
-    const ELF32_Ehdr* eh;
-
-    if (!image || !out_entry || image_size < sizeof(ELF32_Ehdr)) {
-        return -1;
-    }
-
-    eh = (const ELF32_Ehdr*)(const void*)image;
-    if (eh->e_ident[0] != ELF_MAGIC0 || eh->e_ident[1] != ELF_MAGIC1 ||
-        eh->e_ident[2] != ELF_MAGIC2 || eh->e_ident[3] != ELF_MAGIC3 ||
-        eh->e_ident[4] != ELFCLASS32 || eh->e_ident[5] != ELFDATA2LSB || eh->e_type != ET_EXEC ||
-        eh->e_machine != EM_386) {
-        return -1;
-    }
-
-    if (eh->e_phentsize != sizeof(ELF32_Phdr)) {
-        return -1;
-    }
-
-    for (uint16_t i = 0; i < eh->e_phnum; i++) {
-        uint32_t phoff = eh->e_phoff + ((uint32_t)i * eh->e_phentsize);
-        const ELF32_Phdr* ph;
-        if (phoff + sizeof(ELF32_Phdr) > image_size) {
-            return -1;
-        }
-
-        ph = (const ELF32_Phdr*)(const void*)(image + phoff);
-        if (ph->p_type != PT_LOAD) {
-            continue;
-        }
-
-        if (ph->p_memsz < ph->p_filesz || ph->p_vaddr < ELF_LOAD_MIN_VADDR) {
-            return -1;
-        }
-
-        if (ph->p_offset + ph->p_filesz > image_size) {
-            return -1;
-        }
-
-        uint8_t* dest = (uint8_t*)(uintptr_t)ph->p_vaddr;
-        if (ph->p_filesz > 0) {
-            memcpy(dest, image + ph->p_offset, ph->p_filesz);
-        }
-        if (ph->p_memsz > ph->p_filesz) {
-            memset(dest + ph->p_filesz, 0, ph->p_memsz - ph->p_filesz);
-        }
-    }
-
-    *out_entry = eh->e_entry;
-    return 0;
-}
-
-static int load_elf32_from_initramfs(const uint8_t* image, uint32_t image_size,
-                                     uint32_t* out_entry) {
-    static const char* const candidates[] = { "bin/sh", "BIN/SH", "INIT.ELF", "init.elf" };
-
-    for (size_t i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); i++) {
-        const uint8_t* data = NULL;
-        uint32_t size = 0;
-
-        if (find_file_in_initramfs(image, image_size, candidates[i], &data, &size) != 0) {
-            continue;
-        }
-
-        if (load_elf32_from_memory(data, size, out_entry) == 0) {
-            return 0;
-        }
-    }
-
-    return -1;
-}
+#define ET_DYN  3u
+#define PIE_LOAD_BASE 0x400000u   // load PIE binaries here
 
 static int load_elf64_from_memory(const uint8_t* image, uint32_t image_size, uint64_t* out_entry) {
     const ELF64_Ehdr* eh;
 
-    if (!image || !out_entry || image_size < sizeof(ELF64_Ehdr)) {
-        return -1;
-    }
+    if (!image || !out_entry || image_size < sizeof(ELF64_Ehdr)) return -1;
 
     eh = (const ELF64_Ehdr*)(const void*)image;
+
     if (eh->e_ident[0] != ELF_MAGIC0 || eh->e_ident[1] != ELF_MAGIC1 ||
         eh->e_ident[2] != ELF_MAGIC2 || eh->e_ident[3] != ELF_MAGIC3 ||
-        eh->e_ident[4] != ELFCLASS64 || eh->e_ident[5] != ELFDATA2LSB || eh->e_type != ET_EXEC ||
+        eh->e_ident[4] != ELFCLASS64 || eh->e_ident[5] != ELFDATA2LSB ||
         eh->e_machine != EM_X86_64) {
         return -1;
     }
 
-    if (eh->e_phentsize != sizeof(ELF64_Phdr)) {
+    // Accept both ET_EXEC and ET_DYN (PIE)
+    if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) {
         return -1;
     }
+
+    if (eh->e_phentsize != sizeof(ELF64_Phdr)) return -1;
+
+    // PIE binaries have vaddrs relative to 0; give them a base
+    uint64_t load_base = (eh->e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
 
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         uint64_t phoff = eh->e_phoff + ((uint64_t)i * eh->e_phentsize);
         const ELF64_Phdr* ph;
 
-        if (phoff + sizeof(ELF64_Phdr) > image_size) {
-            return -1;
-        }
+        if (phoff + sizeof(ELF64_Phdr) > image_size) return -1;
 
         ph = (const ELF64_Phdr*)(const void*)(image + (uint32_t)phoff);
-        if (ph->p_type != PT_LOAD) {
-            continue;
-        }
+        if (ph->p_type != PT_LOAD) continue;
 
-        if (ph->p_memsz < ph->p_filesz || ph->p_vaddr < 0x100000u) {
-            return -1;
-        }
+        if (ph->p_memsz < ph->p_filesz) return -1;
+        if (ph->p_offset + ph->p_filesz > image_size) return -1;
 
-        if (ph->p_offset + ph->p_filesz > image_size) {
-            return -1;
-        }
+        // For ET_EXEC enforce vaddr >= 0x100000; for PIE vaddr is relative so skip that check
+        if (eh->e_type == ET_EXEC && ph->p_vaddr < 0x100000u) return -1;
 
-        uint8_t* dest = (uint8_t*)(uintptr_t)ph->p_vaddr;
+        uint8_t* dest = (uint8_t*)(uintptr_t)(ph->p_vaddr + load_base);
         if (ph->p_filesz > 0) {
             memcpy(dest, image + (uint32_t)ph->p_offset, (uint32_t)ph->p_filesz);
         }
@@ -359,7 +294,7 @@ static int load_elf64_from_memory(const uint8_t* image, uint32_t image_size, uin
         }
     }
 
-    *out_entry = eh->e_entry;
+    *out_entry = eh->e_entry + load_base;
     return 0;
 }
 
@@ -372,13 +307,14 @@ static int load_elf64_from_initramfs(const uint8_t* image, uint32_t image_size, 
         uint32_t size = 0;
 
         if (find_file_in_initramfs(image, image_size, candidates[i], &data, &size) != 0) {
+            printf("[initramfs] '%s' not found in cpio\n", candidates[i]);
             continue;
         }
 
+        printf("[initramfs] found '%s' (%u bytes), trying ELF load...\n", candidates[i], size);
+
         if (load_elf64_from_memory(data, size, out_entry) == 0) {
-            if (out_path) {
-                *out_path = candidates[i];
-            }
+            if (out_path) *out_path = candidates[i];
             return 0;
         }
     }
@@ -538,47 +474,6 @@ static void user_cmd_cat(const char* path) {
     rt_puts("\n");
 }
 
-__attribute__((noreturn)) static void userland_main(void) {
-    char line[128];
-
-    rt_puts("MeowOS userland (ring3) ready\n");
-    rt_puts("commands: help, pid, echo <text>, cat <path>\n");
-
-    for (;;) {
-        rt_puts("u$ ");
-        rt_read_line(line, sizeof(line));
-
-        if (strcmp(line, "help") == 0) {
-            rt_puts("help\n");
-            rt_puts("pid\n");
-            rt_puts("echo <text>\n");
-            rt_puts("cat <path>\n");
-            continue;
-        }
-
-        if (strcmp(line, "pid") == 0) {
-            int32_t pid = rt_getpid();
-            printf("pid=%d\n", pid);
-            continue;
-        }
-
-        if (strncmp(line, "echo ", 5) == 0) {
-            rt_puts(line + 5);
-            rt_puts("\n");
-            continue;
-        }
-
-        if (strncmp(line, "cat ", 4) == 0) {
-            user_cmd_cat(line + 4);
-            continue;
-        }
-
-        if (line[0] != '\0') {
-            rt_puts("unknown command\n");
-        }
-    }
-}
-
 static void auto_mount_first_root(void) {
     size_t n = vfs_block_device_count();
 
@@ -648,10 +543,9 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
             printf("Loaded 64-bit %s from initramfs entry=0x%x\n",
                    payload_path ? payload_path : "payload", (uint32_t)elf64_entry);
 
-#include <meow/enter_user_mode.h>
-            uint64_t user_stack = 0x80000; // Use a low, identity-mapped stack address
-            printf("Entering user mode at 0x%x with stack 0x%x...\n", (uint32_t)elf64_entry,
-                   (uint32_t)user_stack);
+            uint64_t user_stack = 0x800000;  // 8MB — safe, above kernel
+            printf("Entering user mode at 0x%x with stack 0x%x...\n",
+                   (uint32_t)elf64_entry, (uint32_t)user_stack);  // explicit casts: values fit
             enter_user_mode(elf64_entry, user_stack);
 
             kernel_panic("Initramfs payload returned unexpectedly");
@@ -659,7 +553,30 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
     }
 
     kernel_panic("No runnable initramfs payload (expected /bin/sh)");
-#endif
+
+#else   // <-- added: 32-bit path was entirely missing
+    if (initramfs_addr != 0 && initramfs_size != 0) {
+        const uint8_t* ramfs = (const uint8_t*)(uintptr_t)initramfs_addr;
+        uint32_t elf32_entry = 0;
+        if (load_elf32_from_initramfs(ramfs, initramfs_size, &elf32_entry) == 0) {
+            printf("Loaded 32-bit ELF from initramfs, entry=0x%x\n", elf32_entry);
+            void (*entry_fn)(void) = (void (*)(void))(uintptr_t)elf32_entry;
+            entry_fn();
+            kernel_panic("Initramfs payload returned unexpectedly");
+        }
+    }
+
+    {
+        uint32_t elf32_entry = 0;
+        if (load_elf32_from_vfs("/boot/init.elf", &elf32_entry) == 0 ||
+            load_elf32_from_vfs("/init.elf",      &elf32_entry) == 0) {
+            printf("Loaded 32-bit ELF from VFS, entry=0x%x\n", elf32_entry);
+            void (*entry_fn)(void) = (void (*)(void))(uintptr_t)elf32_entry;
+            entry_fn();
+            kernel_panic("VFS payload returned unexpectedly");
+        }
+    }
 
     kernel_panic("No valid userland entry point found");
+#endif
 }

@@ -7,6 +7,7 @@
 #include <meow/isr.h>
 #include <meow/userland/init.h>
 #include <meow/panic.h>
+#include <meow/longmode.h>
 
 #define MULTIBOOT_BOOTLOADER_MAGIC 0x2BADB002u
 #define MULTIBOOT_INFO_MODS (1u << 3)
@@ -53,6 +54,7 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr) {
     gdt_init();
     interrupts_init();
 
+    install_tss();
     // Reload IDT after long mode switch to ensure valid 64-bit pointer
     idt_install();
 

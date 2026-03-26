@@ -14,7 +14,7 @@ done
 
 cd external/toybox
 make defconfig
-make -j$(nproc)
+CFLAGS="--static -no-pie" LDFLAGS="-no-pie" make -j$(nproc)
 cd ../..
 
 
