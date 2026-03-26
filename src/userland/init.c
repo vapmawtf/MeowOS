@@ -48,6 +48,10 @@ typedef struct ELF32_Phdr {
 #define EM_X86_64 62u
 #define PT_LOAD 1u
 
+#define CPIO_S_IFMT 0170000
+#define CPIO_S_IFREG 0100000
+#define CPIO_S_IFLNK 0120000
+
 #define ELF_LOAD_MIN_VADDR 0x00400000u
 
 typedef struct CPIO_NewcHeader {
@@ -156,23 +160,36 @@ static int is_cpio_candidate(const char* name, const char* want) {
 
 static int find_file_in_initramfs(const uint8_t* image, uint32_t image_size, const char* path,
                                   const uint8_t** out_data, uint32_t* out_size) {
+    return find_file_in_initramfs_internal(image, image_size, path, out_data, out_size, 0);
+}
+
+static int find_file_in_initramfs_internal(const uint8_t* image, uint32_t image_size,
+                                           const char* path, const uint8_t** out_data,
+                                           uint32_t* out_size, int depth) {
     uint32_t off = 0;
 
     if (!image || image_size < CPIO_NEWC_HEADER_SIZE || !path || !out_data || !out_size) {
         return -1;
     }
 
+    if (depth > 8) {
+        return -1;
+    }
+
     while (off + CPIO_NEWC_HEADER_SIZE <= image_size) {
         const CPIO_NewcHeader* hdr = (const CPIO_NewcHeader*)(const void*)(image + off);
+
         uint32_t namesz = 0;
         uint32_t filesz = 0;
+        uint32_t mode = 0;
 
         if (memcmp(hdr->c_magic, CPIO_NEWC_MAGIC, 6) != 0) {
             return -1;
         }
 
         if (parse_hex_u32_8(hdr->c_namesize, &namesz) != 0 ||
-            parse_hex_u32_8(hdr->c_filesize, &filesz) != 0) {
+            parse_hex_u32_8(hdr->c_filesize, &filesz) != 0 ||
+            parse_hex_u32_8(hdr->c_mode, &mode) != 0) {
             return -1;
         }
 
@@ -186,6 +203,7 @@ static int find_file_in_initramfs(const uint8_t* image, uint32_t image_size, con
         }
 
         const char* name = (const char*)(const void*)(image + name_off);
+
         if (strcmp(name, "TRAILER!!!") == 0) {
             return -1;
         }
@@ -196,6 +214,19 @@ static int find_file_in_initramfs(const uint8_t* image, uint32_t image_size, con
         }
 
         if (is_cpio_candidate(name, path)) {
+            if ((mode & CPIO_S_IFMT) == CPIO_S_IFLNK) {
+                const char* target = (const char*)(image + data_off);
+
+                char tmp[128];
+                uint32_t len = (filesz < sizeof(tmp) - 1) ? filesz : (sizeof(tmp) - 1);
+
+                memcpy(tmp, target, len);
+                tmp[len] = '\0';
+
+                return find_file_in_initramfs_internal(image, image_size, tmp, out_data, out_size,
+                                                       depth + 1);
+            }
+
             *out_data = image + data_off;
             *out_size = filesz;
             return 0;

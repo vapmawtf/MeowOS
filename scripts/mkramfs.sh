@@ -21,8 +21,8 @@ fi
 cp "$TOYBOX_BIN" "${OUT_DIR}/bin/toybox"
 chmod +x "${OUT_DIR}/bin/toybox"
 
-# Symlink /bin/sh to /bin/toybox
-ln -sf /bin/toybox "${OUT_DIR}/bin/sh"
+# Symlink /bin/sh to toybox (relative)
+ln -sf toybox "${OUT_DIR}/bin/sh"
 
 # Create dirs
 mkdir -p "${OUT_DIR}/dev" \

@@ -50,7 +50,6 @@ void kernel_main(uint32_t multiboot_magic, uint32_t multiboot_info_addr) {
         }
     }
 
-
     gdt_init();
     interrupts_init();
 

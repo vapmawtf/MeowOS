@@ -27,8 +27,7 @@ void set_idt_gate_user(int n, uint64_t handler) {
 
 static struct IDT_ptr idt_ptr;
 
-__attribute__((naked)) void default_interrupt_stub(void)
-{
+__attribute__((naked)) void default_interrupt_stub(void) {
     __asm__ volatile("iretq");
 }
 
