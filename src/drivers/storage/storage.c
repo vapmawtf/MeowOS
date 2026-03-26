@@ -11,6 +11,7 @@
 #define IDE_SECONDARY_CTRL 0x376
 
 #define ATA_REG_DATA 0x00
+#define ATA_REG_FEATURES 0x01
 #define ATA_REG_SECCOUNT0 0x02
 #define ATA_REG_LBA0 0x03
 #define ATA_REG_LBA1 0x04
@@ -24,9 +25,13 @@
 
 #define ATA_CMD_IDENTIFY 0xEC
 #define ATA_CMD_READ_PIO 0x20
+#define ATA_CMD_WRITE_PIO 0x30
+#define ATA_CMD_IDENTIFY_PACKET 0xA1
+#define ATA_CMD_PACKET 0xA0
 
 #define ATA_SR_ERR 0x01
 #define ATA_SR_DRQ 0x08
+#define ATA_SR_DF 0x20
 #define ATA_SR_BSY 0x80
 
 #define IDE_MAX_DEVICES 4
@@ -61,8 +66,10 @@ typedef struct IDE_Channel
 typedef struct IDE_Device
 {
     uint8_t present;
+    uint8_t is_atapi;
     uint8_t channel;
     uint8_t drive;
+    uint32_t sector_size;
     uint32_t sector_count;
     char name[16];
 } IDE_Device;
@@ -282,6 +289,136 @@ static int ide_wait(const IDE_Channel* channel, int require_drq)
     return -1;
 }
 
+static int ide_wait_bsy_clear(const IDE_Channel* channel)
+{
+    for (uint32_t t = 0; t < 1000000u; t++)
+    {
+        uint8_t status = inb(channel->base + ATA_REG_STATUS);
+        if ((status & ATA_SR_BSY) == 0)
+        {
+            if ((status & (ATA_SR_ERR | ATA_SR_DF)) != 0)
+            {
+                return -1;
+            }
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int atapi_send_packet(const IDE_Channel* channel, uint8_t drive, const uint8_t packet[12], void* out, uint32_t out_bytes)
+{
+    outb(channel->base + ATA_REG_HDDEVSEL, (uint8_t)(0xA0 | (drive << 4)));
+    io_wait();
+
+    outb(channel->base + ATA_REG_FEATURES, 0);
+    outb(channel->base + ATA_REG_LBA1, (uint8_t)(out_bytes & 0xFFu));
+    outb(channel->base + ATA_REG_LBA2, (uint8_t)((out_bytes >> 8) & 0xFFu));
+    outb(channel->base + ATA_REG_COMMAND, ATA_CMD_PACKET);
+
+    if (ide_wait(channel, 1) != 0)
+    {
+        return -1;
+    }
+
+    const uint16_t* words = (const uint16_t*)packet;
+    for (size_t i = 0; i < 6; i++)
+    {
+        outw(channel->base + ATA_REG_DATA, words[i]);
+    }
+
+    if (ide_wait(channel, 1) != 0)
+    {
+        return -1;
+    }
+
+    uint16_t* outwbuf = (uint16_t*)out;
+    for (uint32_t i = 0; i < (out_bytes / 2u); i++)
+    {
+        outwbuf[i] = inw(channel->base + ATA_REG_DATA);
+    }
+
+    ide_delay_400ns(channel);
+    return ide_wait_bsy_clear(channel);
+}
+
+static uint32_t rd32be(const uint8_t* p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+static int atapi_identify(uint8_t channel_index, uint8_t drive, uint32_t* out_sectors)
+{
+    IDE_Channel* channel = &g_ide_channels[channel_index];
+    uint16_t identify[256];
+    uint8_t cap_pkt[12];
+    uint8_t cap[8];
+
+    outb(channel->base + ATA_REG_HDDEVSEL, (uint8_t)(0xA0 | (drive << 4)));
+    io_wait();
+    outb(channel->base + ATA_REG_COMMAND, ATA_CMD_IDENTIFY_PACKET);
+
+    if (ide_wait(channel, 1) != 0)
+    {
+        return -1;
+    }
+
+    for (size_t i = 0; i < 256; i++)
+    {
+        identify[i] = inw(channel->base + ATA_REG_DATA);
+    }
+
+    (void)identify;
+
+    memset(cap_pkt, 0, sizeof(cap_pkt));
+    cap_pkt[0] = 0x25;
+    memset(cap, 0, sizeof(cap));
+
+    if (atapi_send_packet(channel, drive, cap_pkt, cap, sizeof(cap)) != 0)
+    {
+        return -1;
+    }
+
+    *out_sectors = rd32be(&cap[0]) + 1u;
+    return 0;
+}
+
+static int atapi_read_sectors(IDE_Device* dev, uint32_t lba, uint32_t count, void* buffer)
+{
+    IDE_Channel* channel;
+    uint8_t* out = (uint8_t*)buffer;
+
+    if (!dev || !buffer || count == 0)
+    {
+        return -1;
+    }
+
+    channel = &g_ide_channels[dev->channel];
+
+    for (uint32_t i = 0; i < count; i++)
+    {
+        uint8_t pkt[12];
+        memset(pkt, 0, sizeof(pkt));
+        pkt[0] = 0xA8;
+        pkt[2] = (uint8_t)(((lba + i) >> 24) & 0xFFu);
+        pkt[3] = (uint8_t)(((lba + i) >> 16) & 0xFFu);
+        pkt[4] = (uint8_t)(((lba + i) >> 8) & 0xFFu);
+        pkt[5] = (uint8_t)((lba + i) & 0xFFu);
+        pkt[9] = 1;
+
+        if (atapi_send_packet(channel, dev->drive, pkt, out + ((size_t)i * 2048u), 2048u) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 static int ide_identify(uint8_t channel_index, uint8_t drive, uint32_t* out_sectors)
 {
     IDE_Channel* channel = &g_ide_channels[channel_index];
@@ -352,6 +489,11 @@ static int ide_read(void* user, uint32_t lba, uint32_t count, void* buffer)
         return -1;
     }
 
+    if (dev->is_atapi)
+    {
+        return atapi_read_sectors(dev, lba, count, buffer);
+    }
+
     if (dev->sector_count != 0 && (lba + count > dev->sector_count))
     {
         return -1;
@@ -395,6 +537,66 @@ static int ide_read(void* user, uint32_t lba, uint32_t count, void* buffer)
         }
 
         ide_delay_400ns(channel);
+        done += chunk;
+    }
+
+    return 0;
+}
+
+static int ide_write(void* user, uint32_t lba, uint32_t count, const void* buffer)
+{
+    IDE_Device* dev = (IDE_Device*)user;
+    IDE_Channel* channel;
+    const uint8_t* in = (const uint8_t*)buffer;
+    uint32_t done = 0;
+
+    if (!dev || !dev->present || !buffer || count == 0)
+    {
+        return -1;
+    }
+
+    if (dev->is_atapi)
+    {
+        return -1;
+    }
+
+    if (dev->sector_count != 0 && (lba + count > dev->sector_count))
+    {
+        return -1;
+    }
+
+    channel = &g_ide_channels[dev->channel];
+
+    while (done < count)
+    {
+        uint32_t chunk = count - done;
+        if (chunk > 255u)
+        {
+            chunk = 255u;
+        }
+
+        outb(channel->base + ATA_REG_HDDEVSEL,
+             (uint8_t)(0xE0 | (dev->drive << 4) | (((lba + done) >> 24) & 0x0F)));
+        outb(channel->base + ATA_REG_SECCOUNT0, (uint8_t)chunk);
+        outb(channel->base + ATA_REG_LBA0, (uint8_t)((lba + done) & 0xFF));
+        outb(channel->base + ATA_REG_LBA1, (uint8_t)(((lba + done) >> 8) & 0xFF));
+        outb(channel->base + ATA_REG_LBA2, (uint8_t)(((lba + done) >> 16) & 0xFF));
+        outb(channel->base + ATA_REG_COMMAND, ATA_CMD_WRITE_PIO);
+
+        for (uint32_t s = 0; s < chunk; s++)
+        {
+            if (ide_wait(channel, 1) != 0)
+            {
+                return -1;
+            }
+
+            const uint16_t* src = (const uint16_t*)(in + ((done + s) * 512u));
+            for (size_t i = 0; i < 256; i++)
+            {
+                outw(channel->base + ATA_REG_DATA, src[i]);
+            }
+        }
+
         done += chunk;
     }
 
@@ -677,7 +879,7 @@ static int ahci_read(void* user, uint32_t lba, uint32_t count, void* buffer)
     return 0;
 }
 
-static int ahci_write(AHCI_Device* dev, uint32_t lba, uint32_t count, const void* buffer)
+static int ahci_write_dev(AHCI_Device* dev, uint32_t lba, uint32_t count, const void* buffer)
 {
     uint32_t done = 0;
 
@@ -713,6 +915,11 @@ static int ahci_write(AHCI_Device* dev, uint32_t lba, uint32_t count, const void
     }
 
     return 0;
+}
+
+static int ahci_write(void* user, uint32_t lba, uint32_t count, const void* buffer)
+{
+    return ahci_write_dev((AHCI_Device*)user, lba, count, buffer);
 }
 
 static int find_ahci_device(const char* name, AHCI_Device** out_dev)
@@ -801,7 +1008,7 @@ int storage_format_fat32(const char* device_name)
 
     for (uint32_t s = 0; s < reserved; s++)
     {
-        if (ahci_write(dev, s, 1, g_storage_scratch) != 0)
+        if (ahci_write_dev(dev, s, 1, g_storage_scratch) != 0)
         {
             return -1;
         }
@@ -838,11 +1045,11 @@ int storage_format_fat32(const char* device_name)
     g_storage_scratch[510] = 0x55;
     g_storage_scratch[511] = 0xAA;
 
-    if (ahci_write(dev, 0, 1, g_storage_scratch) != 0)
+    if (ahci_write_dev(dev, 0, 1, g_storage_scratch) != 0)
     {
         return -1;
     }
-    if (ahci_write(dev, 6, 1, g_storage_scratch) != 0)
+    if (ahci_write_dev(dev, 6, 1, g_storage_scratch) != 0)
     {
         return -1;
     }
@@ -855,11 +1062,11 @@ int storage_format_fat32(const char* device_name)
     g_storage_scratch[510] = 0x55;
     g_storage_scratch[511] = 0xAA;
 
-    if (ahci_write(dev, 1, 1, g_storage_scratch) != 0)
+    if (ahci_write_dev(dev, 1, 1, g_storage_scratch) != 0)
     {
         return -1;
     }
-    if (ahci_write(dev, 7, 1, g_storage_scratch) != 0)
+    if (ahci_write_dev(dev, 7, 1, g_storage_scratch) != 0)
     {
         return -1;
     }
@@ -872,7 +1079,7 @@ int storage_format_fat32(const char* device_name)
     for (uint32_t f = 0; f < fats; f++)
     {
         uint32_t fat_lba = reserved + (f * spf);
-        if (ahci_write(dev, fat_lba, 1, g_storage_scratch) != 0)
+        if (ahci_write_dev(dev, fat_lba, 1, g_storage_scratch) != 0)
         {
             return -1;
         }
@@ -880,7 +1087,7 @@ int storage_format_fat32(const char* device_name)
         memset(g_storage_scratch, 0, sizeof(g_storage_scratch));
         for (uint32_t s = 1; s < spf; s++)
         {
-            if (ahci_write(dev, fat_lba + s, 1, g_storage_scratch) != 0)
+            if (ahci_write_dev(dev, fat_lba + s, 1, g_storage_scratch) != 0)
             {
                 return -1;
             }
@@ -890,7 +1097,7 @@ int storage_format_fat32(const char* device_name)
     memset(g_storage_scratch, 0, sizeof(g_storage_scratch));
     for (uint32_t s = 0; s < spc; s++)
     {
-        if (ahci_write(dev, data_start + s, 1, g_storage_scratch) != 0)
+        if (ahci_write_dev(dev, data_start + s, 1, g_storage_scratch) != 0)
         {
             return -1;
         }
@@ -902,6 +1109,7 @@ int storage_format_fat32(const char* device_name)
 static void ide_init_devices(void)
 {
     uint32_t ide_index = 0;
+    uint32_t cd_index = 0;
 
     memset(g_ide_devices, 0, sizeof(g_ide_devices));
 
@@ -911,29 +1119,67 @@ static void ide_init_devices(void)
         {
             uint32_t sectors = 0;
             IDE_Device* dev;
+            uint8_t is_atapi = 0;
 
             if (ide_identify(ch, drv, &sectors) != 0)
             {
-                continue;
+                if (atapi_identify(ch, drv, &sectors) != 0)
+                {
+                    continue;
+                }
+                is_atapi = 1;
             }
 
             dev = &g_ide_devices[(ch * 2u) + drv];
             dev->present = 1;
+            dev->is_atapi = is_atapi;
             dev->channel = ch;
             dev->drive = drv;
+            dev->sector_size = is_atapi ? 2048u : 512u;
             dev->sector_count = sectors;
-            make_name("ide", ide_index, dev->name);
 
-            if (vfs_register_block_device(dev->name, 512, dev->sector_count, ide_read, dev) == 0)
+            if (is_atapi)
             {
-                printf("[storage] IDE %s: channel=%u drive=%u sectors=%u\n",
-                       dev->name,
-                       ch,
-                       drv,
-                       dev->sector_count);
+                make_name("cd", cd_index, dev->name);
+            }
+            else
+            {
+                make_name("ide", ide_index, dev->name);
             }
 
-            ide_index++;
+            if (vfs_register_block_device(dev->name,
+                                          dev->sector_size,
+                                          dev->sector_count,
+                                          ide_read,
+                                          is_atapi ? 0 : ide_write,
+                                          dev) == 0)
+            {
+                if (is_atapi)
+                {
+                    printf("[storage] ATAPI %s: channel=%u drive=%u sectors=%u\n",
+                           dev->name,
+                           ch,
+                           drv,
+                           dev->sector_count);
+                }
+                else
+                {
+                    printf("[storage] IDE %s: channel=%u drive=%u sectors=%u\n",
+                           dev->name,
+                           ch,
+                           drv,
+                           dev->sector_count);
+                }
+            }
+
+            if (is_atapi)
+            {
+                cd_index++;
+            }
+            else
+            {
+                ide_index++;
+            }
         }
     }
 }
@@ -989,7 +1235,7 @@ static void ahci_probe_controller(uint32_t abar_phys)
 
         dev->sector_count = sectors;
 
-        if (vfs_register_block_device(dev->name, 512, dev->sector_count, ahci_read, dev) == 0)
+        if (vfs_register_block_device(dev->name, 512, dev->sector_count, ahci_read, ahci_write, dev) == 0)
         {
             printf("[storage] AHCI %s: port=%u sectors=%u\n",
                    dev->name,

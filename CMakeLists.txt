@@ -53,7 +53,7 @@ add_custom_target(iso ALL
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/iso/boot/grub
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/grub.cfg ${CMAKE_BINARY_DIR}/iso/boot/grub/
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/kernel.bin ${CMAKE_BINARY_DIR}/iso/boot/
-    COMMAND grub-mkrescue -o ${CMAKE_BINARY_DIR}/myos.iso ${CMAKE_BINARY_DIR}/iso
+    COMMAND grub-mkrescue -o ${CMAKE_BINARY_DIR}/meowos.iso ${CMAKE_BINARY_DIR}/iso
     DEPENDS kernel.bin
 )
 
@@ -61,7 +61,7 @@ add_custom_target(iso ALL
 add_custom_target(run
     COMMAND qemu-system-x86_64
         -drive if=none,id=ahcidisk,file=${FAT_DISK_IMG},format=raw
-        -cdrom ${CMAKE_BINARY_DIR}/myos.iso
+        -cdrom ${CMAKE_BINARY_DIR}/meowos.iso
         -device ahci,id=ahci0
         -device ide-hd,drive=ahcidisk,bus=ahci0.0
     DEPENDS iso fat_disk

@@ -30,6 +30,29 @@ static int read_sector(const FAT32_FS* fs, uint32_t lba, void* out_sector)
     return fs->read_sectors(fs->read_user, lba, 1, out_sector);
 }
 
+static int write_sector(FAT32_FS* fs, uint32_t lba, const void* in_sector)
+{
+    if (!fs->write_sectors)
+    {
+        return -1;
+    }
+    return fs->write_sectors(fs->write_user, lba, 1, in_sector);
+}
+
+static void wr16(uint8_t* p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+}
+
+static void wr32(uint8_t* p, uint32_t v)
+{
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
 static int fat32_next_cluster(FAT32_FS* fs, uint32_t cluster, uint32_t* out_next)
 {
     uint32_t fat_offset = cluster * 4u;
@@ -257,7 +280,255 @@ static int resolve_path(FAT32_FS* fs, const char* path, FAT32_DirEntry* out_entr
     return -1;
 }
 
-int fat32_mount(FAT32_FS* fs, fat32_read_sectors_fn read_sectors, void* read_user, uint32_t partition_lba)
+static int resolve_parent_and_name(FAT32_FS* fs, const char* path, uint32_t* out_parent_cluster, char out_name83[11])
+{
+    char parent[128];
+    const char* last = 0;
+    size_t len;
+
+    if (!fs || !path || !out_parent_cluster || !out_name83)
+    {
+        return -1;
+    }
+
+    len = strlen(path);
+    if (len == 0 || len >= sizeof(parent))
+    {
+        return -1;
+    }
+
+    strcpy(parent, path);
+
+    while (len > 1 && parent[len - 1] == '/')
+    {
+        parent[len - 1] = '\0';
+        len--;
+    }
+
+    for (size_t i = len; i > 0; i--)
+    {
+        if (parent[i - 1] == '/')
+        {
+            last = &parent[i - 1];
+            break;
+        }
+    }
+
+    if (!last)
+    {
+        if (make_83_name(parent, out_name83) <= 0)
+        {
+            return -1;
+        }
+        *out_parent_cluster = fs->root_cluster;
+        return 0;
+    }
+
+    if (make_83_name(last + 1, out_name83) <= 0)
+    {
+        return -1;
+    }
+
+    if (last == parent)
+    {
+        *out_parent_cluster = fs->root_cluster;
+        return 0;
+    }
+
+    *((char*)last) = '\0';
+    FAT32_DirEntry e;
+    if (resolve_path(fs, parent, &e) != 0 || (e.attr & FAT32_ATTR_DIRECTORY) == 0)
+    {
+        return -1;
+    }
+
+    *out_parent_cluster = e.first_cluster;
+    return 0;
+}
+
+static int fat32_set_fat_entry(FAT32_FS* fs, uint32_t cluster, uint32_t value)
+{
+    uint32_t fat_offset = cluster * 4u;
+    uint32_t sector_lba = fs->fat_start_lba + (fat_offset / fs->bytes_per_sector);
+    uint32_t sector_off = fat_offset % fs->bytes_per_sector;
+
+    for (uint32_t fat = 0; fat < fs->fat_count; fat++)
+    {
+        uint32_t lba = sector_lba + (fat * fs->sectors_per_fat);
+
+        if (read_sector(fs, lba, fs->sector_scratch) != 0)
+        {
+            return -1;
+        }
+
+        if (sector_off + 4u > fs->bytes_per_sector)
+        {
+            return -1;
+        }
+
+        uint32_t cur = rd32(&fs->sector_scratch[sector_off]);
+        cur &= 0xF0000000u;
+        cur |= (value & 0x0FFFFFFFu);
+        wr32(&fs->sector_scratch[sector_off], cur);
+
+        if (write_sector(fs, lba, fs->sector_scratch) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int fat32_alloc_cluster(FAT32_FS* fs, uint32_t* out_cluster)
+{
+    if (!out_cluster)
+    {
+        return -1;
+    }
+
+    for (uint32_t c = 2; c < fs->total_clusters + 2u; c++)
+    {
+        uint32_t next = 0;
+        if (fat32_next_cluster(fs, c, &next) != 0)
+        {
+            return -1;
+        }
+
+        if ((next & 0x0FFFFFFFu) == 0)
+        {
+            if (fat32_set_fat_entry(fs, c, 0x0FFFFFFFu) != 0)
+            {
+                return -1;
+            }
+
+            *out_cluster = c;
+            return 0;
+        }
+    }
+
+    return -1;
+}
+
+static int fat32_zero_cluster(FAT32_FS* fs, uint32_t cluster)
+{
+    uint32_t lba = cluster_to_lba(fs, cluster);
+    memset(fs->sector_scratch, 0, fs->bytes_per_sector);
+
+    for (uint32_t s = 0; s < fs->sectors_per_cluster; s++)
+    {
+        if (write_sector(fs, lba + s, fs->sector_scratch) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int fat32_find_free_entry_slot(FAT32_FS* fs, uint32_t dir_cluster, uint32_t* out_lba, uint32_t* out_off)
+{
+    uint32_t cluster = dir_cluster;
+
+    while (!is_eoc(cluster) && cluster >= 2u)
+    {
+        uint32_t lba = cluster_to_lba(fs, cluster);
+
+        for (uint32_t s = 0; s < fs->sectors_per_cluster; s++)
+        {
+            if (read_sector(fs, lba + s, fs->sector_scratch) != 0)
+            {
+                return -1;
+            }
+
+            for (uint32_t off = 0; off < fs->bytes_per_sector; off += 32)
+            {
+                uint8_t first = fs->sector_scratch[off];
+                if (first == 0x00 || first == 0xE5)
+                {
+                    *out_lba = lba + s;
+                    *out_off = off;
+                    return 0;
+                }
+            }
+        }
+
+        uint32_t next = 0;
+        if (fat32_next_cluster(fs, cluster, &next) != 0)
+        {
+            return -1;
+        }
+
+        if (is_eoc(next))
+        {
+            uint32_t new_cluster = 0;
+            if (fat32_alloc_cluster(fs, &new_cluster) != 0)
+            {
+                return -1;
+            }
+            if (fat32_set_fat_entry(fs, cluster, new_cluster) != 0)
+            {
+                return -1;
+            }
+            if (fat32_zero_cluster(fs, new_cluster) != 0)
+            {
+                return -1;
+            }
+            cluster = new_cluster;
+        }
+        else
+        {
+            cluster = next;
+        }
+    }
+
+    return -1;
+}
+
+static int fat32_create_entry(FAT32_FS* fs, uint32_t parent_cluster, const char name83[11], uint8_t attr, uint32_t first_cluster, uint32_t size)
+{
+    uint32_t lba = 0;
+    uint32_t off = 0;
+
+    FAT32_DirEntry existing;
+    if (find_in_directory(fs, parent_cluster, name83, &existing) == 0)
+    {
+        return -1;
+    }
+
+    if (fat32_find_free_entry_slot(fs, parent_cluster, &lba, &off) != 0)
+    {
+        return -1;
+    }
+
+    if (read_sector(fs, lba, fs->sector_scratch) != 0)
+    {
+        return -1;
+    }
+
+    uint8_t* e = &fs->sector_scratch[off];
+    memset(e, 0, 32);
+    memcpy(e, name83, 11);
+    e[11] = attr;
+    wr16(&e[20], (uint16_t)((first_cluster >> 16) & 0xFFFFu));
+    wr16(&e[26], (uint16_t)(first_cluster & 0xFFFFu));
+    wr32(&e[28], size);
+
+    if (write_sector(fs, lba, fs->sector_scratch) != 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+int fat32_mount(
+    FAT32_FS* fs,
+    fat32_read_sectors_fn read_sectors,
+    fat32_write_sectors_fn write_sectors,
+    void* read_user,
+    void* write_user,
+    uint32_t partition_lba)
 {
     if (!fs || !read_sectors)
     {
@@ -266,7 +537,9 @@ int fat32_mount(FAT32_FS* fs, fat32_read_sectors_fn read_sectors, void* read_use
 
     memset(fs, 0, sizeof(*fs));
     fs->read_sectors = read_sectors;
+    fs->write_sectors = write_sectors;
     fs->read_user = read_user;
+    fs->write_user = write_user;
     fs->partition_lba = partition_lba;
 
     if (fs->read_sectors(fs->read_user, partition_lba, 1, fs->sector_scratch) != 0)
@@ -547,4 +820,215 @@ int fat32_list_dir(FAT32_FS* fs, const char* path, fat32_list_callback_fn callba
     }
 
     return 0;
+}
+
+int fat32_create_file(FAT32_FS* fs, const char* path)
+{
+    uint32_t parent_cluster;
+    char name83[11];
+
+    if (!fs || !path || !fs->write_sectors)
+    {
+        return -1;
+    }
+
+    if (resolve_parent_and_name(fs, path, &parent_cluster, name83) != 0)
+    {
+        return -1;
+    }
+
+    return fat32_create_entry(fs, parent_cluster, name83, 0x20u, 0, 0);
+}
+
+int fat32_mkdir(FAT32_FS* fs, const char* path)
+{
+    uint32_t parent_cluster;
+    char name83[11];
+    uint32_t new_cluster;
+
+    if (!fs || !path || !fs->write_sectors)
+    {
+        return -1;
+    }
+
+    if (resolve_parent_and_name(fs, path, &parent_cluster, name83) != 0)
+    {
+        return -1;
+    }
+
+    if (fat32_alloc_cluster(fs, &new_cluster) != 0)
+    {
+        return -1;
+    }
+
+    if (fat32_zero_cluster(fs, new_cluster) != 0)
+    {
+        return -1;
+    }
+
+    if (fat32_create_entry(fs, parent_cluster, name83, FAT32_ATTR_DIRECTORY, new_cluster, 0) != 0)
+    {
+        return -1;
+    }
+
+    uint32_t lba = cluster_to_lba(fs, new_cluster);
+    if (read_sector(fs, lba, fs->sector_scratch) != 0)
+    {
+        return -1;
+    }
+
+    memset(fs->sector_scratch, 0, fs->bytes_per_sector);
+    uint8_t* dot = &fs->sector_scratch[0];
+    memset(dot, ' ', 11);
+    dot[0] = '.';
+    dot[11] = FAT32_ATTR_DIRECTORY;
+    wr16(&dot[20], (uint16_t)((new_cluster >> 16) & 0xFFFFu));
+    wr16(&dot[26], (uint16_t)(new_cluster & 0xFFFFu));
+
+    uint8_t* dotdot = &fs->sector_scratch[32];
+    memset(dotdot, ' ', 11);
+    dotdot[0] = '.';
+    dotdot[1] = '.';
+    dotdot[11] = FAT32_ATTR_DIRECTORY;
+    wr16(&dotdot[20], (uint16_t)((parent_cluster >> 16) & 0xFFFFu));
+    wr16(&dotdot[26], (uint16_t)(parent_cluster & 0xFFFFu));
+
+    if (write_sector(fs, lba, fs->sector_scratch) != 0)
+    {
+        return -1;
+    }
+
+    return 0;
+}
+
+int fat32_write_file(FAT32_FS* fs, const char* path, const void* data, uint32_t size)
+{
+    uint32_t parent_cluster;
+    char name83[11];
+    const uint8_t* in = (const uint8_t*)data;
+    uint32_t first_cluster = 0;
+    uint32_t prev = 0;
+    uint32_t remaining = size;
+    uint32_t cluster_size;
+
+    if (!fs || !path || (!data && size != 0) || !fs->write_sectors)
+    {
+        return -1;
+    }
+
+    if (resolve_parent_and_name(fs, path, &parent_cluster, name83) != 0)
+    {
+        return -1;
+    }
+
+    FAT32_DirEntry existing;
+    int have_existing = (find_in_directory(fs, parent_cluster, name83, &existing) == 0);
+    if (have_existing && (existing.attr & FAT32_ATTR_DIRECTORY))
+    {
+        return -1;
+    }
+
+    cluster_size = (uint32_t)fs->bytes_per_sector * fs->sectors_per_cluster;
+
+    if (size > 0)
+    {
+        while (remaining > 0)
+        {
+            uint32_t c = 0;
+            if (fat32_alloc_cluster(fs, &c) != 0)
+            {
+                return -1;
+            }
+
+            if (first_cluster == 0)
+            {
+                first_cluster = c;
+            }
+
+            if (prev != 0)
+            {
+                if (fat32_set_fat_entry(fs, prev, c) != 0)
+                {
+                    return -1;
+                }
+            }
+
+            uint32_t lba = cluster_to_lba(fs, c);
+            uint32_t chunk = remaining > cluster_size ? cluster_size : remaining;
+
+            for (uint32_t s = 0; s < fs->sectors_per_cluster; s++)
+            {
+                uint32_t off = s * fs->bytes_per_sector;
+                memset(fs->sector_scratch, 0, fs->bytes_per_sector);
+
+                if (off < chunk)
+                {
+                    uint32_t can = fs->bytes_per_sector;
+                    if (off + can > chunk)
+                    {
+                        can = chunk - off;
+                    }
+                    memcpy(fs->sector_scratch, in + off, can);
+                }
+
+                if (write_sector(fs, lba + s, fs->sector_scratch) != 0)
+                {
+                    return -1;
+                }
+            }
+
+            in += chunk;
+            remaining -= chunk;
+            prev = c;
+        }
+    }
+
+    if (!have_existing)
+    {
+        return fat32_create_entry(fs, parent_cluster, name83, 0x20u, first_cluster, size);
+    }
+
+    uint32_t dir_cluster = parent_cluster;
+    while (!is_eoc(dir_cluster) && dir_cluster >= 2u)
+    {
+        uint32_t lba = cluster_to_lba(fs, dir_cluster);
+        for (uint32_t s = 0; s < fs->sectors_per_cluster; s++)
+        {
+            if (read_sector(fs, lba + s, fs->sector_scratch) != 0)
+            {
+                return -1;
+            }
+
+            for (uint32_t off = 0; off < fs->bytes_per_sector; off += 32)
+            {
+                uint8_t* e = &fs->sector_scratch[off];
+                if (e[0] == 0x00)
+                {
+                    return -1;
+                }
+                if (e[0] == 0xE5 || e[11] == FAT32_ATTR_LONG_NAME)
+                {
+                    continue;
+                }
+                if (memcmp(e, name83, 11) == 0)
+                {
+                    wr16(&e[20], (uint16_t)((first_cluster >> 16) & 0xFFFFu));
+                    wr16(&e[26], (uint16_t)(first_cluster & 0xFFFFu));
+                    wr32(&e[28], size);
+                    if (write_sector(fs, lba + s, fs->sector_scratch) != 0)
+                    {
+                        return -1;
+                    }
+                    return 0;
+                }
+            }
+        }
+
+        if (fat32_next_cluster(fs, dir_cluster, &dir_cluster) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return -1;
 }

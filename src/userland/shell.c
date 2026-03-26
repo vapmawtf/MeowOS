@@ -1,9 +1,20 @@
 #include <meow/vga.h>
 #include <meow/userland/shell.h>
 #include <meow/io.h>
+#include <meow/runtime.h>
 #include <meow/string.h>
 #include <meow/storage.h>
 #include <meow/vfs.h>
+
+static void rt_write_str(const char* s)
+{
+    if (!s)
+    {
+        return;
+    }
+
+    (void)rt_write(1, s, (uint32_t)strlen(s));
+}
 
 static char to_hex_digit(uint8_t v)
 {
@@ -49,6 +60,111 @@ static int parse_u32(const char* s, uint32_t* out)
     return 0;
 }
 
+static int starts_with(const char* s, const char* prefix)
+{
+    while (*prefix)
+    {
+        if (*s != *prefix)
+        {
+            return 0;
+        }
+        s++;
+        prefix++;
+    }
+    return 1;
+}
+
+static int mount_drive_root(int drive_index)
+{
+    size_t n = vfs_block_device_count();
+
+    if (drive_index == 0)
+    {
+        for (size_t i = 0; i < n; i++)
+        {
+            VFS_BlockDeviceInfo info;
+            if (vfs_get_block_device(i, &info) != 0)
+            {
+                continue;
+            }
+
+            if (starts_with(info.name, "cd"))
+            {
+                continue;
+            }
+
+            if (vfs_mount_fat32_root(info.name, 0) == 0)
+            {
+                printf("Switched to 0:/ on %s\n", info.name);
+                return 0;
+            }
+        }
+
+        return -1;
+    }
+
+    if (drive_index == 1)
+    {
+        for (size_t i = 0; i < n; i++)
+        {
+            VFS_BlockDeviceInfo info;
+            if (vfs_get_block_device(i, &info) != 0)
+            {
+                continue;
+            }
+
+            if (!starts_with(info.name, "cd"))
+            {
+                continue;
+            }
+
+            if (vfs_mount_iso_root(info.name, 0) == 0)
+            {
+                printf("Switched to 1:/ on %s\n", info.name);
+                return 0;
+            }
+        }
+
+        return -1;
+    }
+
+    return -1;
+}
+
+static void cmd_cd(const char* args)
+{
+    while (args && (*args == ' ' || *args == '\t'))
+    {
+        args++;
+    }
+
+    if (!args || !*args)
+    {
+        printf("usage: cd <0:/|1:/>\n");
+        return;
+    }
+
+    if (strcmp(args, "0:/") == 0)
+    {
+        if (mount_drive_root(0) != 0)
+        {
+            printf("cd: failed to switch to 0:/\n");
+        }
+        return;
+    }
+
+    if (strcmp(args, "1:/") == 0)
+    {
+        if (mount_drive_root(1) != 0)
+        {
+            printf("cd: failed to switch to 1:/\n");
+        }
+        return;
+    }
+
+    printf("cd: only 0:/ and 1:/ are supported right now\n");
+}
+
 static int print_dir_entry(const FAT32_DirEntry* entry, void* user)
 {
     (void)user;
@@ -58,7 +174,7 @@ static int print_dir_entry(const FAT32_DirEntry* entry, void* user)
     }
     else
     {
-        printf("%6u %s\n", entry->size, entry->short_name);
+        printf("%u %s\n", entry->size, entry->short_name);
     }
     return 0;
 }
@@ -66,7 +182,7 @@ static int print_dir_entry(const FAT32_DirEntry* entry, void* user)
 static void cmd_lsblk(void)
 {
     size_t n = vfs_block_device_count();
-    printf("NAME | SECTOR_SIZE | SECTORS | READ\n");
+    printf("NAME | SECTOR_SIZE | SECTORS | READ | WRITE\n");
     if (n == 0)
     {
         printf("(no block devices registered)\n");
@@ -78,11 +194,12 @@ static void cmd_lsblk(void)
         VFS_BlockDeviceInfo info;
         if (vfs_get_block_device(i, &info) == 0)
         {
-            printf("%s | %u | %u | %s\n",
+            printf("%s | %u | %u | %s | %s\n",
                    info.name,
                    info.sector_size,
                    info.sector_count,
-                   info.readable ? "yes" : "no");
+                   info.readable ? "yes" : "no",
+                   info.writable ? "yes" : "no");
         }
     }
 }
@@ -93,7 +210,7 @@ static void cmd_ls(const char* path)
 
     if (!vfs_is_root_mounted())
     {
-        printf("No filesystem mounted. Use: mount fat <device> [partition_lba]\n");
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
         return;
     }
 
@@ -169,6 +286,75 @@ static void cmd_mount_fat(const char* args)
     else
     {
         printf("mount fat failed for device %s (LBA %u)\n", dev, lba);
+    }
+}
+
+static void cmd_mount_iso(const char* args)
+{
+    char dev[16];
+    uint32_t lba = 0;
+    int has_lba = 0;
+    size_t i = 0;
+
+    if (!args || !*args)
+    {
+        printf("usage: mount iso <device> [partition_lba]\n");
+        return;
+    }
+
+    while (*args == ' ' || *args == '\t')
+    {
+        args++;
+    }
+
+    while (*args && *args != ' ' && *args != '\t' && i < sizeof(dev) - 1)
+    {
+        dev[i++] = *args++;
+    }
+    dev[i] = '\0';
+
+    if (dev[0] == '\0' || strchr(dev, '/') != 0)
+    {
+        printf("usage: mount iso <device> [partition_lba]\n");
+        return;
+    }
+
+    while (*args == ' ' || *args == '\t')
+    {
+        args++;
+    }
+
+    if (*args)
+    {
+        const char* p = args;
+        while (*p && *p != ' ' && *p != '\t')
+        {
+            if (*p < '0' || *p > '9')
+            {
+                printf("mount iso: partition_lba must be a decimal number\n");
+                return;
+            }
+            p++;
+        }
+
+        has_lba = 1;
+        lba = (uint32_t)atoi(args);
+    }
+
+    if (vfs_mount_iso_root(dev, lba) == 0)
+    {
+        if (has_lba)
+        {
+            printf("Mounted ISO9660 root from %s (LBA %u)\n", dev, lba);
+        }
+        else
+        {
+            printf("Mounted ISO9660 root from %s\n", dev);
+        }
+    }
+    else
+    {
+        printf("mount iso failed for device %s (LBA %u)\n", dev, lba);
     }
 }
 
@@ -254,7 +440,7 @@ static void cmd_cat(const char* args)
 
     if (!vfs_is_root_mounted())
     {
-        printf("No filesystem mounted. Use: mount fat <device> [partition_lba]\n");
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
         return;
     }
 
@@ -324,7 +510,7 @@ static void cmd_hexdump(const char* args)
 
     if (!vfs_is_root_mounted())
     {
-        printf("No filesystem mounted. Use: mount fat <device> [partition_lba]\n");
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
         return;
     }
 
@@ -471,7 +657,7 @@ static void cmd_head(const char* args)
 
     if (!vfs_is_root_mounted())
     {
-        printf("No filesystem mounted. Use: mount fat <device> [partition_lba]\n");
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
         return;
     }
 
@@ -581,7 +767,7 @@ static void cmd_read_range(const char* args)
 
     if (!vfs_is_root_mounted())
     {
-        printf("No filesystem mounted. Use: mount fat <device> [partition_lba]\n");
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
         return;
     }
 
@@ -625,6 +811,185 @@ static void cmd_read_range(const char* args)
     putchar('\n');
 }
 
+static void cmd_syscat(const char* args)
+{
+    char path[96];
+    char buffer[128];
+    int32_t fd;
+    size_t i = 0;
+
+    while (args && (*args == ' ' || *args == '\t'))
+    {
+        args++;
+    }
+
+    if (!args || !*args)
+    {
+        printf("usage: syscat <path>\n");
+        return;
+    }
+
+    while (*args && *args != ' ' && *args != '\t' && i < sizeof(path) - 1)
+    {
+        path[i++] = *args++;
+    }
+    path[i] = '\0';
+
+    fd = rt_open(path, RT_O_RDONLY, 0);
+    if (fd < 0)
+    {
+        rt_write_str("syscat: open failed\n");
+        return;
+    }
+
+    while (1)
+    {
+        int32_t n = rt_read(fd, buffer, sizeof(buffer));
+        if (n < 0)
+        {
+            rt_write_str("syscat: read failed\n");
+            (void)rt_close(fd);
+            return;
+        }
+        if (n == 0)
+        {
+            break;
+        }
+
+        if (rt_write(1, buffer, (uint32_t)n) < 0)
+        {
+            rt_write_str("syscat: write failed\n");
+            (void)rt_close(fd);
+            return;
+        }
+    }
+
+    (void)rt_close(fd);
+    rt_write_str("\n");
+}
+
+static void cmd_mkdir(const char* args)
+{
+    char path[96];
+    size_t i = 0;
+
+    while (args && (*args == ' ' || *args == '\t'))
+    {
+        args++;
+    }
+
+    if (!args || !*args)
+    {
+        printf("usage: mkdir <path>\n");
+        return;
+    }
+
+    while (*args && *args != ' ' && *args != '\t' && i < sizeof(path) - 1)
+    {
+        path[i++] = *args++;
+    }
+    path[i] = '\0';
+
+    if (!vfs_is_root_mounted())
+    {
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
+        return;
+    }
+
+    if (vfs_mkdir(path) != 0)
+    {
+        printf("mkdir: failed to create '%s'\n", path);
+        return;
+    }
+
+    printf("mkdir: created '%s'\n", path);
+}
+
+static void cmd_mkfile(const char* args)
+{
+    char path[96];
+    size_t i = 0;
+
+    while (args && (*args == ' ' || *args == '\t'))
+    {
+        args++;
+    }
+
+    if (!args || !*args)
+    {
+        printf("usage: mkfile <path>\n");
+        return;
+    }
+
+    while (*args && *args != ' ' && *args != '\t' && i < sizeof(path) - 1)
+    {
+        path[i++] = *args++;
+    }
+    path[i] = '\0';
+
+    if (!vfs_is_root_mounted())
+    {
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
+        return;
+    }
+
+    if (vfs_create_file(path) != 0)
+    {
+        printf("mkfile: failed to create '%s'\n", path);
+        return;
+    }
+
+    printf("mkfile: created '%s'\n", path);
+}
+
+static void cmd_writefile(const char* args)
+{
+    char path[96];
+    size_t i = 0;
+
+    while (args && (*args == ' ' || *args == '\t'))
+    {
+        args++;
+    }
+
+    if (!args || !*args)
+    {
+        printf("usage: writefile <path> <text>\n");
+        return;
+    }
+
+    while (*args && *args != ' ' && *args != '\t' && i < sizeof(path) - 1)
+    {
+        path[i++] = *args++;
+    }
+    path[i] = '\0';
+
+    while (*args == ' ' || *args == '\t')
+    {
+        args++;
+    }
+
+    if (!*args)
+    {
+        printf("usage: writefile <path> <text>\n");
+        return;
+    }
+
+    if (!vfs_is_root_mounted())
+    {
+        printf("No filesystem mounted. Use: mount <fat|iso> <device> [partition_lba]\n");
+        return;
+    }
+
+    if (vfs_write_file(path, args, (uint32_t)strlen(args)) != 0)
+    {
+        printf("writefile: failed for '%s'\n", path);
+        return;
+    }
+
+    printf("writefile: wrote %u bytes to '%s'\n", (uint32_t)strlen(args), path);
+}
+
 void shell_main()
 {
     char command[128];
@@ -644,12 +1009,19 @@ void shell_main()
             printf("  clear - Clear the screen\n");
             printf("  lsblk - List block devices\n");
             printf("  mount fat <device> [partition_lba] - Mount FAT32 root\n");
+            printf("  mount iso <device> [partition_lba] - Mount ISO9660 root\n");
+            printf("  cd 0:/ - Switch to FAT root\n");
+            printf("  cd 1:/ - Switch to ISO root\n");
             printf("  diskutil format <device> fat - Format disk as FAT32\n");
             printf("  cat <path> - Print file contents\n");
             printf("  hexdump <path> [max_bytes] - Hex dump file bytes\n");
             printf("  head <path> [bytes] - Print first bytes from file\n");
             printf("  read <path> <offset> <length> - Print a file range\n");
             printf("  readsec <device> <lba> - Hex dump raw disk sector\n");
+            printf("  syscat <path> - Read file through syscall runtime\n");
+            printf("  mkdir <path> - Create directory\n");
+            printf("  mkfile <path> - Create empty file\n");
+            printf("  writefile <path> <text> - Create/overwrite file text\n");
             printf("  ls [path] - List directory entries\n");
         }
         else if (strncmp(command, "echo ", 5) == 0)
@@ -671,6 +1043,14 @@ void shell_main()
         else if (strncmp(command, "mount fat", 9) == 0)
         {
             cmd_mount_fat(command + 9);
+        }
+        else if (strncmp(command, "mount iso", 9) == 0)
+        {
+            cmd_mount_iso(command + 9);
+        }
+        else if (strncmp(command, "cd ", 3) == 0)
+        {
+            cmd_cd(command + 3);
         }
         else if (strncmp(command, "diskutil format", 15) == 0)
         {
@@ -695,6 +1075,22 @@ void shell_main()
         else if (strncmp(command, "read ", 5) == 0)
         {
             cmd_read_range(command + 5);
+        }
+        else if (strncmp(command, "syscat ", 7) == 0)
+        {
+            cmd_syscat(command + 7);
+        }
+        else if (strncmp(command, "mkdir ", 6) == 0)
+        {
+            cmd_mkdir(command + 6);
+        }
+        else if (strncmp(command, "mkfile ", 7) == 0)
+        {
+            cmd_mkfile(command + 7);
+        }
+        else if (strncmp(command, "writefile ", 10) == 0)
+        {
+            cmd_writefile(command + 10);
         }
         else if (strcmp(command, "ls") == 0)
         {
