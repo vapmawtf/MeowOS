@@ -4,3 +4,6 @@
 [submodule "external/libxcrypt"]
 	path = external/libxcrypt
 	url = https://github.com/besser82/libxcrypt.git
+[submodule "external/microshell"]
+	path = external/microshell
+	url = https://github.com/marcinbor85/microshell
