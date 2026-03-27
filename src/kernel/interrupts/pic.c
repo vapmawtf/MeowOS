@@ -1,22 +1,21 @@
 #include <stdint.h>
-#include <meow/pic.h>
+#include <meow/io.h>
 
-void pic_remap() {
-    uint8_t a1 = inb(PIC1_DATA);
-    uint8_t a2 = inb(PIC2_DATA);
+void pic_remap()
+{
+    outb(0x20, 0x11);
+    outb(0xA0, 0x11);
 
-    outb(PIC1_COMMAND, ICW1_INIT | ICW1_ICW4);
-    outb(PIC2_COMMAND, ICW1_INIT | ICW1_ICW4);
+    outb(0x21, 0x20);
+    outb(0xA1, 0x28);
 
-    outb(PIC1_DATA, 0x20); // offset przerwań IRQ0 → 0x20
-    outb(PIC2_DATA, 0x28); // offset przerwań IRQ8 → 0x28
+    outb(0x21, 0x04);
+    outb(0xA1, 0x02);
 
-    outb(PIC1_DATA, 4);
-    outb(PIC2_DATA, 2);
+    outb(0x21, 0x01);
+    outb(0xA1, 0x01);
 
-    outb(PIC1_DATA, ICW4_8086);
-    outb(PIC2_DATA, ICW4_8086);
-
-    outb(PIC1_DATA, a1);
-    outb(PIC2_DATA, a2);
+    // IRQ0,1,2 enabled
+    outb(0x21, 0xF8);
+    outb(0xA1, 0xFF);
 }

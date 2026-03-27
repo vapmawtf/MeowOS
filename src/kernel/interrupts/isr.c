@@ -2,6 +2,15 @@
 #include <meow/pic.h>
 #include <meow/idt.h>
 #include <meow/syscall.h>
+#include <meow/scheduler.h>
+#include <meow/interrupts.h>
+
+volatile uint64_t irq0_saved_rsp = 0;
+volatile uint64_t irq0_saved_rip = 0;
+volatile uint64_t irq0_saved_cs = 0;
+volatile uint64_t irq0_saved_rflags = 0;
+volatile uint64_t irq0_saved_user_rsp = 0;
+volatile uint64_t irq0_saved_ss = 0;
 
 #define KEYBOARD_DATA 0x60
 #define PIC_EOI 0x20
@@ -53,15 +62,18 @@ static char apply_caps_lock(char c) {
     return c;
 }
 
-void default_interrupt_handler() {
-    __asm__ volatile("cli");
-    printf("\nUnhandled interrupt - system halted\n");
-    while (1) {
+void default_interrupt_handler(struct interrupt_frame* f)
+{
+    printf("[EXCEPTION] RIP=%llx CS=%llx RFLAGS=%llx\n",
+           f->rip, f->cs, f->rflags);
+
+    for (;;)
         __asm__ volatile("hlt");
-    }
 }
 
+
 void irq0_handler() {
+    scheduler_tick();
     outb(PIC1_COMMAND, PIC_EOI);
 }
 
@@ -112,16 +124,14 @@ void irq1_handler() {
 
 void interrupts_init() {
     __asm__ volatile("cli");
-
-    idt_install();
     pic_remap();
     set_idt_gate(0x20, (uint64_t)irq0_stub);
     set_idt_gate(0x21, (uint64_t)irq1_stub);
     set_idt_gate_user(0x80, (uint64_t)syscall_stub);
     syscall_init();
 
-    // Enable IRQ0/IRQ1 and keep IRQ2 (cascade to slave PIC) unmasked.
-    outb(PIC1_DATA, 0xF8);
+    // Temporarily keep all PIC interrupts masked until IRQ frame is stable.
+    outb(PIC1_DATA, 0xFF);
     outb(PIC2_DATA, 0xFF);
 
     __asm__ volatile("sti");
