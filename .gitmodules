@@ -1,3 +1,6 @@
 [submodule "external/toybox"]
 	path = external/toybox
 	url = https://github.com/landley/toybox
+[submodule "external/libxcrypt"]
+	path = external/libxcrypt
+	url = https://github.com/besser82/libxcrypt.git
