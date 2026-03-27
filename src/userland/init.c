@@ -9,6 +9,11 @@
 #include <meow/panic.h>
 #include <meow/enter_user_mode.h>
 
+#include <stdint.h>
+#include <stddef.h>
+#include <meow/string.h>
+#include <meow/elf64.h>
+
 typedef struct ELF32_Ehdr {
     uint8_t e_ident[16];
     uint16_t e_type;
@@ -241,6 +246,43 @@ static int find_file_in_initramfs_internal(const uint8_t* image, uint32_t image_
     }
 
     return -1;
+}
+
+
+void load_elf64(const uint8_t* elf_data)
+{
+    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)elf_data;
+
+    // Sprawdzenie magic
+    if (ehdr->e_ident[0] != 0x7f || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L' || ehdr->e_ident[3] != 'F')
+    {
+        puts("Invalid ELF file");
+        return;
+    }
+
+    // Przejście po wszystkich program headers
+    Elf64_Phdr* phdr = (Elf64_Phdr*)(elf_data + ehdr->e_phoff);
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++)
+    {
+        if (phdr[i].p_type != PT_LOAD)
+            continue;
+
+        // Kopiowanie segmentu do pamięci docelowej
+        uint8_t* dest = (uint8_t*)(uintptr_t)phdr[i].p_vaddr;
+        const uint8_t* src = elf_data + phdr[i].p_offset;
+
+        for (uint64_t j = 0; j < phdr[i].p_filesz; j++)
+            dest[j] = src[j];
+
+        // Zerowanie części BSS
+        for (uint64_t j = phdr[i].p_filesz; j < phdr[i].p_memsz; j++)
+            dest[j] = 0;
+    }
+
+    // Wywołanie entry point
+    void (*entry)() = (void(*)())ehdr->e_entry;
+    entry();
 }
 
 #define ET_DYN  3u
@@ -510,7 +552,8 @@ static void auto_mount_first_root(void) {
     }
 }
 
-void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
+void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size)
+{
     vfs_init();
     storage_init();
     auto_mount_first_root();
@@ -528,25 +571,28 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
 
     printf("Initializing userland...\n");
     printf("Welcome to MeowOS!\n");
-    printf(" _____               _____ _____ \n");
-    printf("|     |___ ___ _ _ _|     |   __|\n");
-    printf("| | | | -_| . | | | |  |  |__   |\n");
-    printf("|_|_|_|___|___|_____|_____|_____|\n");
-    printf("\n");
 
 #ifdef MEOW_KERNEL_64
     if (initramfs_addr != 0 && initramfs_size != 0) {
         const uint8_t* ramfs = (const uint8_t*)(uintptr_t)initramfs_addr;
         uint64_t elf64_entry = 0;
         const char* payload_path = NULL;
+
         if (load_elf64_from_initramfs(ramfs, initramfs_size, &elf64_entry, &payload_path) == 0) {
             printf("Loaded 64-bit %s from initramfs entry=0x%x\n",
                    payload_path ? payload_path : "payload", (uint32_t)elf64_entry);
 
-            uint64_t user_stack = 0x800000;  // 8MB — safe, above kernel
+            uint64_t user_stack_top = 0x800000;
+            user_stack_top &= ~0xFul; // align to 16 bytes
+            uint64_t* stack = (uint64_t*)user_stack_top;
+
+            *(--stack) = 0;              // NULL
+            *(--stack) = (uint64_t)"sh"; // argv[0]
+            *(--stack) = (uint64_t)1;    // argc
+
             printf("Entering user mode at 0x%x with stack 0x%x...\n",
-                   (uint32_t)elf64_entry, (uint32_t)user_stack);  // explicit casts: values fit
-            enter_user_mode(elf64_entry, user_stack);
+                   (uint32_t)elf64_entry, (uint32_t)user_stack_top);
+            enter_user_mode(elf64_entry, (uint64_t)stack);
 
             kernel_panic("Initramfs payload returned unexpectedly");
         }
@@ -554,10 +600,11 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
 
     kernel_panic("No runnable initramfs payload (expected /bin/sh)");
 
-#else   // <-- added: 32-bit path was entirely missing
+#else   // 32-bit path
     if (initramfs_addr != 0 && initramfs_size != 0) {
         const uint8_t* ramfs = (const uint8_t*)(uintptr_t)initramfs_addr;
         uint32_t elf32_entry = 0;
+
         if (load_elf32_from_initramfs(ramfs, initramfs_size, &elf32_entry) == 0) {
             printf("Loaded 32-bit ELF from initramfs, entry=0x%x\n", elf32_entry);
             void (*entry_fn)(void) = (void (*)(void))(uintptr_t)elf32_entry;
@@ -566,10 +613,11 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
         }
     }
 
+    // fallback: load from VFS
     {
         uint32_t elf32_entry = 0;
         if (load_elf32_from_vfs("/boot/init.elf", &elf32_entry) == 0 ||
-            load_elf32_from_vfs("/init.elf",      &elf32_entry) == 0) {
+            load_elf32_from_vfs("/init.elf", &elf32_entry) == 0) {
             printf("Loaded 32-bit ELF from VFS, entry=0x%x\n", elf32_entry);
             void (*entry_fn)(void) = (void (*)(void))(uintptr_t)elf32_entry;
             entry_fn();

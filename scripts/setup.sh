@@ -12,9 +12,17 @@ for tool in "${REQUIRED_TOOLS[@]}"; do
     fi
 done
 
+cd external/libxcrypt
+autoreconf -fvi
+./configure --enable-static
+make
+sudo make install
+cd ../..
+
 cd external/toybox
-make defconfig
-CFLAGS="--static -no-pie" LDFLAGS="-no-pie" make -j$(nproc)
+make clean
+CFLAGS="-static -no-pie" LDFLAGS="-static -no-pie" make defconfig
+CFLAGS="-static -no-pie" LDFLAGS="-static -no-pie -lcrypt" make -j$(nproc)
 cd ../..
 
 
