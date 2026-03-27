@@ -106,6 +106,28 @@ add_custom_command(
 )
 
 # ----------------------------
+# Microshell: build from external/microshell with minimal MeowOS wrapper
+# ----------------------------
+set(MICROSHELL_SRC "${CMAKE_SOURCE_DIR}/external/microshell_meow_main.c")
+set(MICROSHELL_DST "${CMAKE_BINARY_DIR}/microshell")
+
+add_custom_command(
+    OUTPUT ${MICROSHELL_DST}
+    COMMAND sh -c
+        "if [ ! -d '${CMAKE_SOURCE_DIR}/external/microshell' ]; then \
+             echo 'ERROR: microshell submodule not found. Run: git submodule update --init' >&2; \
+             exit 1; \
+         fi"
+    COMMAND gcc -static -no-pie
+        -I${CMAKE_SOURCE_DIR}/external/microshell/src/inc
+        -o ${MICROSHELL_DST}
+        ${MICROSHELL_SRC}
+    DEPENDS ${MICROSHELL_SRC}
+    COMMENT "Building microshell binary"
+    VERBATIM
+)
+
+# ----------------------------
 # Initramfs using mkramfs.sh
 # Fix: DEPENDS on the actual output file ${TOYBOX_DST}, not a
 # custom target — this is the correct way to chain custom commands.
@@ -118,7 +140,7 @@ add_custom_command(
     OUTPUT ${INITRAMFS_CPIO}
     COMMAND chmod +x ${MKRAMFS_SCRIPT}
     COMMAND ${MKRAMFS_SCRIPT} ${CMAKE_BINARY_DIR}
-    DEPENDS ${MKRAMFS_SCRIPT} ${TOYBOX_DST}
+    DEPENDS ${MKRAMFS_SCRIPT} ${TOYBOX_DST} ${MICROSHELL_DST}
     COMMENT "Generating initramfs.cpio"
     VERBATIM
 )

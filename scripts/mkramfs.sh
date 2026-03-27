@@ -24,6 +24,17 @@ chmod +x "${OUT_DIR}/bin/toybox"
 # Symlink /bin/sh to toybox (relative)
 ln -sf toybox "${OUT_DIR}/bin/sh"
 
+# Check microshell
+MICROSHELL_BIN="$ROOT_DIR/build/microshell"
+if [[ -f "$MICROSHELL_BIN" ]]; then
+    echo "Including microshell in initramfs"
+    cp "$MICROSHELL_BIN" "${OUT_DIR}/bin/microshell"
+    chmod +x "${OUT_DIR}/bin/microshell"
+    ln -sf microshell "${OUT_DIR}/bin/msh"
+else
+    echo "Warning: Microshell binary not found at $MICROSHELL_BIN"
+fi
+
 # Create dirs
 mkdir -p "${OUT_DIR}/dev" \
          "${OUT_DIR}/proc" \

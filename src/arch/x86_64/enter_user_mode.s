@@ -36,7 +36,11 @@ enter_user_mode_asm:
 .globl call_user_code_kernel_mode
 .type call_user_code_kernel_mode, @function
 call_user_code_kernel_mode:
-    # Set RSP to user stack, then jump to entry point
+    # Set RSP to user stack, then call entry point (not jump)
+    # This ensures a proper return address is on the stack
     mov %rsi, %rsp         # Set stack pointer
     xor %rbp, %rbp         # Clear frame pointer (entry point expects this)
-    jmp *%rdi              # Jump to entry point (no return address pushed)
+    call *%rdi             # Call entry point (pushes return address)
+    
+    # If we return here, the shell exited - just halt
+    hlt

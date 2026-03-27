@@ -360,11 +360,9 @@ static int load_elf64_from_memory(const uint8_t* image, uint32_t image_size, uin
 static int load_elf64_from_initramfs(const uint8_t* image, uint32_t image_size, uint64_t* out_entry,
                                      const char** out_path) {
     static const char* const candidates[] = {
-        "/bin/sh",
-        "bin/sh",
-        "/bin/toybox",
-        "bin/toybox",
-        "BIN/SH",
+        "/bin/msh",
+        "/bin/microshell",
+        "bin/microshell",
     };
     for (size_t i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); i++) {
         const uint8_t* data = NULL;
@@ -492,7 +490,7 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
             uint64_t user_stack_top = 0x800000;
             user_stack_top &= ~0xFULL;
 
-            const char* argv0 = "sh";
+            const char* argv0 = "";
             uint64_t argv0_addr = (user_stack_top - 16) & ~0xFULL;
             memcpy((void*)(uintptr_t)argv0_addr, argv0, 3); // "sh\0"
 
@@ -509,6 +507,11 @@ void init_userland(uint32_t initramfs_addr, uint32_t initramfs_size) {
             printf("Initializing shell...\n");
             printf("User stack top: 0x%llx (argv0 @ 0x%llx)\n", (unsigned long long)user_stack_top,
                    (unsigned long long)argv0_addr);
+            
+            // Debug: check what's at the entry point
+            uint8_t* code_ptr = (uint8_t*)(uintptr_t)elf64_entry;
+            printf("[DEBUG] Entry point 0x%llx bytes: %02x %02x %02x %02x\n",
+                   (unsigned long long)elf64_entry, code_ptr[0], code_ptr[1], code_ptr[2], code_ptr[3]);
 
             // Launch the shell as the primary process
             call_user_code_kernel_mode(elf64_entry, final_rsp);
